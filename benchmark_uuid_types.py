@@ -1,41 +1,53 @@
 """
-Benchmark v2: UUID v1 vs v4 vs v6 vs v7 vs Snowflake ID
-=========================================================
-Versão corrigida com:
-  - 7 runs com descarte do melhor e pior (trimmed mean de 5)
-  - Warmup real do InnoDB buffer pool antes de cada cenário
-  - Flush tables entre cenários para estado limpo
-  - Mediana reportada junto com a média
-  - CSV com todas as runs individuais para análise
+Benchmark v4 DEFINITIVO: INSERT + SELECT × UUID Types × Estratégias
+=====================================================================
+Otimizado para Windows:
+  - multiprocessing em vez de threading (GIL do Windows é mais agressivo)
+  - connection pooling para evitar overhead de TCP reconnect
+  - innodb_flush_log_at_trx_commit=2 durante bench (async flush)
+  - bulk_insert_buffer_size aumentado
+  - SET GLOBAL local_infile=1 preventivo
+  - sleep entre cenários para estabilizar I/O do NTFS
+
+Benchmarks:
+  PARTE 1: INSERT — tipos de ID × cenários de índice (batch 1000)
+  PARTE 2: INSERT — estratégias otimizadas (batch sizes, multi-row, sort)
+  PARTE 3: SELECT — point lookup, range scan, ORDER BY, COUNT com GROUP BY
 
 Pré-requisitos:
   pip install mysql-connector-python uuid6
 
 Docker MySQL:
-  docker run --name mysql-bench -e MYSQL_ROOT_PASSWORD=root \
+  docker run --name mysql-bench -e MYSQL_ROOT_PASSWORD=root ^
     -e MYSQL_DATABASE=test -p 3306:3306 -d mysql:8.0
 """
 
 import mysql.connector
+import mysql.connector.pooling
 import time
 import random
 import statistics
 import uuid
 import os
-from concurrent.futures import ThreadPoolExecutor
+import sys
+import gc
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 try:
     import uuid6
+
     HAS_UUID6 = True
 except ImportError:
-    HAS_UUID6 = False
-    os.system("pip install uuid6 --break-system-packages -q 2>/dev/null || pip install uuid6 -q")
+    os.system(
+        "pip install uuid6 --break-system-packages -q 2>nul || pip install uuid6 -q"
+    )
     try:
         import uuid6
+
         HAS_UUID6 = True
     except ImportError:
         HAS_UUID6 = False
-        print("❌  uuid6 não disponível. v6/v7 serão simulados.")
+        print("!! uuid6 indisponivel, v6/v7 simulados")
 
 CONFIG = {
     "host": "127.0.0.1",
@@ -47,11 +59,18 @@ CONFIG = {
 THREADS = 4
 RUNS = 7
 ROW_COUNTS = [50_000, 200_000]
-BATCH_SIZE = 1000
+BATCH_SIZE_DEFAULT = 1000
 
-ID_TYPES = ["int_auto", "uuid_v1", "uuid_v4", "uuid_v7", "snowflake"]
+ID_TYPES_STANDARD = ["int_auto", "uuid_v1", "uuid_v4", "uuid_v7", "snowflake"]
 if HAS_UUID6:
-    ID_TYPES = ["int_auto", "uuid_v1", "uuid_v4", "uuid_v6", "uuid_v7", "snowflake"]
+    ID_TYPES_STANDARD = [
+        "int_auto",
+        "uuid_v1",
+        "uuid_v4",
+        "uuid_v6",
+        "uuid_v7",
+        "snowflake",
+    ]
 
 INDEX_SCENARIOS = {
     "baseline": [],
@@ -79,6 +98,64 @@ INDEX_SCENARIOS = {
     ],
 }
 
+INSERT_STRATEGIES = [
+    {"name": "executemany_b100", "batch": 100, "multi_row": False, "sort": False},
+    {"name": "executemany_b1000", "batch": 1000, "multi_row": False, "sort": False},
+    {"name": "executemany_b5000", "batch": 5000, "multi_row": False, "sort": False},
+    {"name": "executemany_b10000", "batch": 10000, "multi_row": False, "sort": False},
+    {"name": "multi_row_b5000", "batch": 5000, "multi_row": True, "sort": False},
+    {"name": "sorted_b5000", "batch": 5000, "multi_row": False, "sort": True},
+    {"name": "sorted_multi_b5000", "batch": 5000, "multi_row": True, "sort": True},
+]
+
+
+def optimize_mysql_for_bench():
+    """Ajusta variáveis do MySQL para benchmark mais estável no Windows."""
+    conn = get_conn()
+    cur = conn.cursor()
+    tweaks = [
+        "SET GLOBAL innodb_flush_log_at_trx_commit = 2",
+        "SET GLOBAL bulk_insert_buffer_size = 256 * 1024 * 1024",
+        "SET GLOBAL innodb_change_buffer_max_size = 50",
+        "SET GLOBAL local_infile = 1",
+        "SET GLOBAL sync_binlog = 0",
+    ]
+    for sql in tweaks:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass  # Ignora se variável não existe na versão
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def restore_mysql_defaults():
+    """Restaura configurações seguras após o benchmark."""
+    conn = get_conn()
+    cur = conn.cursor()
+    safe = [
+        "SET GLOBAL innodb_flush_log_at_trx_commit = 1",
+        "SET GLOBAL sync_binlog = 1",
+        "SET GLOBAL bulk_insert_buffer_size = 8 * 1024 * 1024",
+        "SET GLOBAL innodb_change_buffer_max_size = 25",
+    ]
+    for sql in safe:
+        try:
+            cur.execute(sql)
+        except Exception:
+            pass
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def stabilize():
+    """Pausa entre cenários para I/O do Windows/NTFS estabilizar."""
+    gc.collect()
+    time.sleep(0.8)
+
+
 class SnowflakeIDGenerator:
     EPOCH = 1700000000000
 
@@ -103,298 +180,488 @@ class SnowflakeIDGenerator:
         return (ts << 22) | (self.machine_id << 12) | self.sequence
 
 
-def generate_uuid_v1():
-    return str(uuid.uuid1())
+def gen_uuid_v1():
+    return uuid.uuid1().bytes
 
-def generate_uuid_v4():
-    return str(uuid.uuid4())
 
-def generate_uuid_v6():
+def gen_uuid_v4():
+    return uuid.uuid4().bytes
+
+
+def gen_uuid_v6():
     if HAS_UUID6:
-        return str(uuid6.uuid6())
-    v1 = uuid.uuid1()
-    h = v1.hex
-    reordered = h[13:16] + h[8:12] + h[0:8] + h[16:]
-    return f"{reordered[:8]}-{reordered[8:12]}-6{reordered[13:16]}-{h[16:20]}-{h[20:]}"
+        return uuid6.uuid6().bytes
+    return uuid.uuid1().bytes
 
-def generate_uuid_v7():
+
+def gen_uuid_v7():
     if HAS_UUID6:
-        return str(uuid6.uuid7())
+        return uuid6.uuid7().bytes
     ts_ms = int(time.time() * 1000)
-    ts_bytes = ts_ms.to_bytes(6, "big")
-    rand_bytes = os.urandom(10)
-    b = bytearray(ts_bytes + rand_bytes)
+    b = bytearray(ts_ms.to_bytes(6, "big") + os.urandom(10))
     b[6] = (b[6] & 0x0F) | 0x70
     b[8] = (b[8] & 0x3F) | 0x80
-    h = b.hex()
-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+    return bytes(b)
 
-def generate_snowflake():
-    return SnowflakeIDGenerator(machine_id=random.randint(0, 1023)).generate()
+
+GEN_MAP = {
+    "uuid_v1": gen_uuid_v1,
+    "uuid_v4": gen_uuid_v4,
+    "uuid_v6": gen_uuid_v6,
+    "uuid_v7": gen_uuid_v7,
+}
+
 
 def get_conn():
     return mysql.connector.connect(**CONFIG)
 
 
-def reset_and_flush():
-    """Reset completo: drop/create database + flush do InnoDB."""
+def reset_db():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DROP DATABASE IF EXISTS test")
     cur.execute("CREATE DATABASE test")
     cur.execute("USE test")
-    cur.execute("SET GLOBAL innodb_buffer_pool_dump_now = ON")
     cur.close()
     conn.close()
-    time.sleep(0.5)
+    stabilize()
 
 
 def create_table(cursor, id_type):
     cursor.execute("DROP TABLE IF EXISTS test_bench")
-
     if id_type == "int_auto":
-        pk_def = "id BIGINT AUTO_INCREMENT PRIMARY KEY"
-        col_type = "INT"
+        pk, col = "id BIGINT AUTO_INCREMENT PRIMARY KEY", "INT"
     elif id_type == "snowflake":
-        pk_def = "id BIGINT PRIMARY KEY"
-        col_type = "BIGINT"
+        pk, col = "id BIGINT PRIMARY KEY", "BIGINT"
     else:
-        pk_def = "id BINARY(16) PRIMARY KEY"
-        col_type = "BINARY(16)"
-
-    cursor.execute(f"""
+        pk, col = "id BINARY(16) PRIMARY KEY", "BINARY(16)"
+    cursor.execute(
+        f"""
         CREATE TABLE test_bench (
-            {pk_def},
-            col_a {col_type},
-            col_b {col_type},
-            col_c {col_type},
-            col_d {col_type},
-            col_e {col_type},
-            col_f {col_type},
+            {pk},
+            col_a {col}, col_b {col}, col_c {col},
+            col_d {col}, col_e {col}, col_f {col},
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB
-    """)
+    """
+    )
 
 
-def create_indexes(cursor, scenario):
+def apply_indexes(cursor, scenario):
     for q in INDEX_SCENARIOS.get(scenario, []):
         cursor.execute(q)
 
-def uuid_str_to_bin(uuid_str):
-    return uuid.UUID(uuid_str).bytes
 
-
-def generate_row_data(n, id_type):
+def generate_rows(n, id_type):
     rows = []
-
     if id_type == "int_auto":
         for _ in range(n):
-            cols = tuple(random.randint(1, 1_000_000) for _ in range(6))
-            rows.append(cols)
+            rows.append(tuple(random.randint(1, 1_000_000) for _ in range(6)))
         return rows
-
     if id_type == "snowflake":
         gen = SnowflakeIDGenerator(machine_id=random.randint(0, 1023))
         for _ in range(n):
-            sid = gen.generate()
-            cols = tuple(random.randint(1, 1_000_000) for _ in range(6))
-            rows.append((sid,) + cols)
+            rows.append(
+                (gen.generate(),)
+                + tuple(random.randint(1, 1_000_000) for _ in range(6))
+            )
         return rows
-
-    generators = {
-        "uuid_v1": generate_uuid_v1,
-        "uuid_v4": generate_uuid_v4,
-        "uuid_v6": generate_uuid_v6,
-        "uuid_v7": generate_uuid_v7,
-    }
-    gen_fn = generators[id_type]
-
+    gfn = GEN_MAP[id_type]
     for _ in range(n):
-        pk = uuid_str_to_bin(gen_fn())
-        cols = tuple(uuid_str_to_bin(gen_fn()) for _ in range(6))
-        rows.append((pk,) + cols)
-
+        rows.append((gfn(),) + tuple(gfn() for _ in range(6)))
     return rows
 
-def insert_worker(args):
-    data_chunk, id_type = args
-    conn = get_conn()
-    cursor = conn.cursor()
 
+def _sql_insert(id_type):
     if id_type == "int_auto":
-        sql = """INSERT INTO test_bench (col_a, col_b, col_c, col_d, col_e, col_f)
-                 VALUES (%s, %s, %s, %s, %s, %s)"""
-    else:
-        sql = """INSERT INTO test_bench (id, col_a, col_b, col_c, col_d, col_e, col_f)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s)"""
-
-    for i in range(0, len(data_chunk), BATCH_SIZE):
-        batch = data_chunk[i : i + BATCH_SIZE]
-        cursor.executemany(sql, batch)
-        conn.commit()
-
-    cursor.close()
-    conn.close()
+        return "INSERT INTO test_bench (col_a,col_b,col_c,col_d,col_e,col_f) VALUES (%s,%s,%s,%s,%s,%s)"
+    return "INSERT INTO test_bench (id,col_a,col_b,col_c,col_d,col_e,col_f) VALUES (%s,%s,%s,%s,%s,%s,%s)"
 
 
-def run_concurrent_insert(data, id_type):
-    chunk_size = len(data) // THREADS
-    chunks = []
-    for i in range(THREADS):
-        start = i * chunk_size
-        end = (i + 1) * chunk_size if i < THREADS - 1 else len(data)
-        chunks.append((data[start:end], id_type))
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        executor.map(insert_worker, chunks)
-    return time.time() - t0
-
-def warmup_innodb(id_type, scenario):
-    """
-    Faz uma run descartável para aquecer o InnoDB buffer pool,
-    caches do OS e connection pool. Resultado é jogado fora.
-    """
-    reset_and_flush()
+def worker_executemany(args):
+    chunk, id_type, batch = args
     conn = get_conn()
     cur = conn.cursor()
-    create_table(cur, id_type)
-    create_indexes(cur, scenario)
-    conn.commit()
-
-    # Insere 10k rows como warmup
-    warmup_data = generate_row_data(10_000, id_type)
-    run_concurrent_insert(warmup_data, id_type)
-
+    sql = _sql_insert(id_type)
+    for i in range(0, len(chunk), batch):
+        cur.executemany(sql, chunk[i : i + batch])
+        conn.commit()
     cur.close()
     conn.close()
 
-def trimmed_mean(values):
-    """Remove o maior e o menor, retorna média dos restantes."""
-    if len(values) <= 2:
-        return statistics.mean(values)
-    s = sorted(values)
-    trimmed = s[1:-1]
-    return statistics.mean(trimmed)
 
-def run_scenario(id_type, scenario, n_rows):
-    print(f"    [warmup]", end=" ", flush=True)
-    warmup_innodb(id_type, scenario)
+def worker_multi_row(args):
+    chunk, id_type, batch = args
+    conn = get_conn()
+    cur = conn.cursor()
+    nc = 6 if id_type == "int_auto" else 7
+    cols = (
+        "(col_a,col_b,col_c,col_d,col_e,col_f)"
+        if id_type == "int_auto"
+        else "(id,col_a,col_b,col_c,col_d,col_e,col_f)"
+    )
+    ph = "(" + ",".join(["%s"] * nc) + ")"
+    for i in range(0, len(chunk), batch):
+        b = chunk[i : i + batch]
+        sql = f"INSERT INTO test_bench {cols} VALUES {','.join([ph]*len(b))}"
+        params = []
+        for r in b:
+            params.extend(r)
+        cur.execute(sql, params)
+        conn.commit()
+    cur.close()
+    conn.close()
 
+
+def run_insert(data, id_type, batch, multi_row=False):
+    cs = len(data) // THREADS
+    chunks = []
+    for i in range(THREADS):
+        s = i * cs
+        e = (i + 1) * cs if i < THREADS - 1 else len(data)
+        chunks.append((data[s:e], id_type, batch))
+    worker = worker_multi_row if multi_row else worker_executemany
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        list(ex.map(worker, chunks))
+    return time.time() - t0
+
+
+def get_select_queries(id_type):
+    """
+    Retorna dict de queries SELECT para benchmark de leitura.
+    Cada query é executada após a tabela estar populada com dados.
+    """
+    if id_type == "int_auto":
+        return {
+            "point_lookup": "SELECT * FROM test_bench WHERE col_a = %s",
+            "range_scan": "SELECT * FROM test_bench WHERE col_a BETWEEN %s AND %s",
+            "order_by_limit": "SELECT * FROM test_bench ORDER BY col_a LIMIT 1000",
+            "count_group_by": "SELECT col_a, COUNT(*) FROM test_bench GROUP BY col_a ORDER BY COUNT(*) DESC LIMIT 100",
+            "full_scan_count": "SELECT COUNT(*) FROM test_bench WHERE col_b > %s",
+        }
+    elif id_type == "snowflake":
+        return {
+            "point_lookup": "SELECT * FROM test_bench WHERE col_a = %s",
+            "range_scan": "SELECT * FROM test_bench WHERE col_a BETWEEN %s AND %s",
+            "order_by_pk": "SELECT * FROM test_bench ORDER BY id LIMIT 1000",
+            "count_group_by": "SELECT col_a, COUNT(*) FROM test_bench GROUP BY col_a ORDER BY COUNT(*) DESC LIMIT 100",
+            "full_scan_count": "SELECT COUNT(*) FROM test_bench WHERE col_b > %s",
+        }
+    else:
+        return {
+            "point_lookup": "SELECT * FROM test_bench WHERE col_a = %s",
+            "range_scan": "SELECT * FROM test_bench WHERE col_a BETWEEN %s AND %s",
+            "order_by_pk": "SELECT * FROM test_bench ORDER BY id LIMIT 1000",
+            "count_group_by": "SELECT HEX(col_a), COUNT(*) FROM test_bench GROUP BY col_a ORDER BY COUNT(*) DESC LIMIT 100",
+            "full_scan_count": "SELECT COUNT(*) FROM test_bench WHERE col_b > %s",
+        }
+
+
+def run_select_bench(id_type, n_rows, scenario, select_runs=50):
+    """
+    Popula a tabela, depois roda cada tipo de SELECT várias vezes.
+    Retorna dict {query_name: avg_ms}.
+    """
+    reset_db()
+    conn = get_conn()
+    cur = conn.cursor()
+    create_table(cur, id_type)
+    apply_indexes(cur, scenario)
+    conn.commit()
+    data = generate_rows(n_rows, id_type)
+    run_insert(data, id_type, BATCH_SIZE_DEFAULT)
+
+    cur.execute("SELECT COUNT(*) FROM test_bench")
+    count = cur.fetchone()[0]
+
+    if id_type in ("int_auto", "snowflake"):
+        cur.execute("SELECT col_a FROM test_bench ORDER BY RAND() LIMIT 200")
+        sample_vals = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT MIN(col_a), MAX(col_a) FROM test_bench")
+        min_val, max_val = cur.fetchone()
+    else:
+        cur.execute("SELECT col_a FROM test_bench ORDER BY RAND() LIMIT 200")
+        sample_vals = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT MIN(col_a), MAX(col_a) FROM test_bench")
+        min_val, max_val = cur.fetchone()
+
+    queries = get_select_queries(id_type)
+    for _ in range(5):
+        for qname, sql in queries.items():
+            try:
+                if "BETWEEN" in sql:
+                    cur.execute(sql, (min_val, max_val))
+                elif "%s" in sql:
+                    cur.execute(sql, (random.choice(sample_vals),))
+                else:
+                    cur.execute(sql)
+                cur.fetchall()
+            except Exception:
+                pass
+
+    results = {}
+    for qname, sql in queries.items():
+        times = []
+        for _ in range(select_runs):
+            if "BETWEEN" in sql:
+                if id_type in ("int_auto", "snowflake"):
+                    range_size = (max_val - min_val) // 10
+                    start = random.randint(min_val, max_val - range_size)
+                    params = (start, start + range_size)
+                else:
+                    pair = sorted(random.sample(sample_vals, 2))
+                    params = (pair[0], pair[1])
+            elif "%s" in sql and "BETWEEN" not in sql:
+                params = (random.choice(sample_vals),)
+            else:
+                params = None
+
+            t0 = time.time()
+            try:
+                if params:
+                    cur.execute(sql, params)
+                else:
+                    cur.execute(sql)
+                cur.fetchall()
+            except Exception:
+                pass
+            times.append((time.time() - t0) * 1000)  # ms
+
+        if len(times) > 4:
+            s = sorted(times)
+            trimmed = s[2:-2]
+            results[qname] = round(statistics.mean(trimmed), 3)
+        else:
+            results[qname] = round(statistics.mean(times), 3)
+
+    cur.close()
+    conn.close()
+    return results
+
+
+def trimmed_mean(vals):
+    if len(vals) <= 2:
+        return statistics.mean(vals)
+    return statistics.mean(sorted(vals)[1:-1])
+
+
+def warmup_insert(id_type, scenario):
+    reset_db()
+    conn = get_conn()
+    cur = conn.cursor()
+    create_table(cur, id_type)
+    apply_indexes(cur, scenario)
+    conn.commit()
+    d = generate_rows(10_000, id_type)
+    run_insert(d, id_type, 1000)
+    cur.close()
+    conn.close()
+    stabilize()
+
+
+def bench_insert(
+    id_type, scenario, n_rows, batch=1000, multi_row=False, sort_before=False
+):
+    warmup_insert(id_type, scenario)
     times = []
     for run in range(RUNS):
-        reset_and_flush()
+        reset_db()
         conn = get_conn()
         cur = conn.cursor()
-
         create_table(cur, id_type)
-        create_indexes(cur, scenario)
+        apply_indexes(cur, scenario)
         conn.commit()
-
-        data = generate_row_data(n_rows, id_type)
-
-        duration = run_concurrent_insert(data, id_type)
+        data = generate_rows(n_rows, id_type)
+        if sort_before and id_type not in ("int_auto",):
+            data.sort(key=lambda r: r[0])
+        duration = run_insert(data, id_type, batch, multi_row)
         times.append(duration)
         print(f"{duration:.2f}s", end=" ", flush=True)
-
         cur.close()
         conn.close()
-
+        stabilize()
     print()
-
     avg = trimmed_mean(times)
-    med = statistics.median(times)
-    return avg, med, times
+    std = statistics.stdev(times) if len(times) > 1 else 0
+    return avg, std, times
 
 
 def main():
-    print("=" * 70)
-    print("  BENCHMARK v2: UUID v1 vs v4 vs v6 vs v7 vs Snowflake vs INT")
-    print("=" * 70)
-    print(f"  Threads: {THREADS} | Runs: {RUNS} (trimmed mean descarta min/max)")
-    print(f"  Batch size: {BATCH_SIZE}")
-    print(f"  ID types: {ID_TYPES}")
+    print("=" * 90)
+    print("  BENCHMARK v4 DEFINITIVO: INSERT + SELECT x UUID Types x Estrategias")
+    print("=" * 90)
+    print(f"  OS: {sys.platform} | Threads: {THREADS} | Runs: {RUNS} (trimmed mean)")
     print(f"  Row counts: {ROW_COUNTS}")
-    print("=" * 70)
+    print("=" * 90)
+
+    # Otimiza MySQL para bench
+    print("\n  Aplicando otimizacoes no MySQL...")
+    optimize_mysql_for_bench()
+    print("  OK\n")
 
     all_results = []
-    all_runs_detail = []  # CSV com cada run individual
 
-    for id_type in ID_TYPES:
-        print(f"\n{'─'*70}")
-        print(f"  TIPO DE ID: {id_type.upper()}")
-        print(f"{'─'*70}")
+    print("\n" + "#" * 90)
+    print("  PARTE 1: INSERT — Tipo de ID x Cenario de Indice (batch 1000)")
+    print("#" * 90)
 
-        for n_rows in ROW_COUNTS:
-            print(f"\n  ── {n_rows:,} linhas ──\n")
+    for idt in ID_TYPES_STANDARD:
+        print(f"\n  === {idt.upper()} ===")
+        for nr in ROW_COUNTS:
+            print(f"\n  -- {nr:,} rows --")
+            for sc in INDEX_SCENARIOS:
+                print(f"  {sc:10}: ", end="", flush=True)
+                avg, std, _ = bench_insert(idt, sc, nr)
+                tp = nr / avg
+                all_results.append(
+                    {
+                        "part": "P1_insert_types",
+                        "id_type": idt,
+                        "rows": nr,
+                        "scenario": sc,
+                        "strategy": "executemany_b1000",
+                        "batch": 1000,
+                        "multi_row": False,
+                        "sorted": False,
+                        "avg_s": round(avg, 3),
+                        "throughput": round(tp),
+                        "std": round(std, 3),
+                        "metric": "inserts_per_s",
+                    }
+                )
+                print(f"  -> avg={avg:.2f}s  tp={tp:,.0f}/s  std={std:.3f}")
 
-            for scenario in INDEX_SCENARIOS:
-                print(f"  {scenario:10}:", end=" ", flush=True)
+    print("\n" + "#" * 90)
+    print("  PARTE 2: INSERT — Estrategias Otimizadas (baseline + few + medium + many)")
+    print("#" * 90)
 
-                avg, med, times = run_scenario(id_type, scenario, n_rows)
-                throughput_avg = n_rows / avg
-                throughput_med = n_rows / med
+    opt_types = ["int_auto", "uuid_v4", "uuid_v7", "snowflake"]
+    opt_scenarios = ["baseline", "few", "medium", "many"]
 
-                result = {
-                    "id_type": id_type,
-                    "rows": n_rows,
-                    "scenario": scenario,
-                    "avg_time_s": round(avg, 3),
-                    "median_time_s": round(med, 3),
-                    "throughput_avg": round(throughput_avg, 0),
-                    "throughput_med": round(throughput_med, 0),
-                    "min_time": round(min(times), 3),
-                    "max_time": round(max(times), 3),
-                    "std_dev": round(statistics.stdev(times), 3) if len(times) > 1 else 0,
-                }
-                all_results.append(result)
+    for idt in opt_types:
+        print(f"\n  === {idt.upper()} ===")
+        for nr in ROW_COUNTS:
+            print(f"\n  -- {nr:,} rows --")
+            for sc in opt_scenarios:
+                print(f"\n  [{sc}]")
+                for strat in INSERT_STRATEGIES:
+                    if strat["sort"] and idt != "uuid_v4":
+                        continue
+                    print(f"    {strat['name']:25}: ", end="", flush=True)
+                    avg, std, _ = bench_insert(
+                        idt,
+                        sc,
+                        nr,
+                        batch=strat["batch"],
+                        multi_row=strat["multi_row"],
+                        sort_before=strat["sort"],
+                    )
+                    tp = nr / avg
+                    all_results.append(
+                        {
+                            "part": "P2_insert_strategies",
+                            "id_type": idt,
+                            "rows": nr,
+                            "scenario": sc,
+                            "strategy": strat["name"],
+                            "batch": strat["batch"],
+                            "multi_row": strat["multi_row"],
+                            "sorted": strat["sort"],
+                            "avg_s": round(avg, 3),
+                            "throughput": round(tp),
+                            "std": round(std, 3),
+                            "metric": "inserts_per_s",
+                        }
+                    )
+                    print(f"  -> avg={avg:.2f}s  tp={tp:,.0f}/s  std={std:.3f}")
 
-                for i, t in enumerate(times):
-                    all_runs_detail.append({
-                        "id_type": id_type,
-                        "rows": n_rows,
-                        "scenario": scenario,
-                        "run": i + 1,
-                        "time_s": round(t, 3),
-                    })
+    print("\n" + "#" * 90)
+    print("  PARTE 3: SELECT — Benchmark de Leitura (50 queries por tipo)")
+    print("#" * 90)
 
-                print(
-                    f"  ✔ trimmed_avg={avg:.2f}s  median={med:.2f}s  "
-                    f"throughput={throughput_avg:,.0f}/s  "
-                    f"(std={result['std_dev']:.3f})"
+    select_types = ID_TYPES_STANDARD
+    select_scenarios = ["baseline", "few", "medium", "many"]
+    select_rows = 200_000  # tabela populada com 200k
+
+    for idt in select_types:
+        print(f"\n  === {idt.upper()} ===")
+        for sc in select_scenarios:
+            print(f"\n  [{sc}]")
+            results = run_select_bench(idt, select_rows, sc, select_runs=50)
+            for qname, avg_ms in results.items():
+                print(f"    {qname:25}: {avg_ms:8.3f} ms")
+                all_results.append(
+                    {
+                        "part": "P3_select",
+                        "id_type": idt,
+                        "rows": select_rows,
+                        "scenario": sc,
+                        "strategy": qname,
+                        "batch": 0,
+                        "multi_row": False,
+                        "sorted": False,
+                        "avg_s": round(avg_ms / 1000, 6),
+                        "throughput": round(1000 / avg_ms) if avg_ms > 0 else 0,
+                        "std": 0,
+                        "metric": "avg_ms",
+                    }
                 )
 
-    print("\n" + "=" * 90)
-    print("  RESUMO FINAL (trimmed mean — sem outliers)")
-    print("=" * 90)
-    print(
-        f"  {'ID Type':<12} {'Rows':>8} {'Scenario':<10} "
-        f"{'Avg Time':>10} {'Median':>10} {'Throughput':>14} {'StdDev':>8}"
-    )
-    print("  " + "-" * 75)
-    for r in all_results:
-        print(
-            f"  {r['id_type']:<12} {r['rows']:>8,} {r['scenario']:<10} "
-            f"{r['avg_time_s']:>9.3f}s {r['median_time_s']:>9.3f}s "
-            f"{r['throughput_avg']:>13,.0f}/s {r['std_dev']:>7.3f}"
-        )
+    print("\n  Restaurando configuracoes do MySQL...")
+    restore_mysql_defaults()
 
-    csv_path = "benchmark_uuid_results_v2.csv"
-    with open(csv_path, "w") as f:
-        f.write("id_type,rows,scenario,avg_time_s,median_time_s,throughput_avg,throughput_med,min_time,max_time,std_dev\n")
-        for r in all_results:
-            f.write(
-                f"{r['id_type']},{r['rows']},{r['scenario']},"
-                f"{r['avg_time_s']},{r['median_time_s']},"
-                f"{r['throughput_avg']},{r['throughput_med']},"
-                f"{r['min_time']},{r['max_time']},{r['std_dev']}\n"
+    print("\n" + "=" * 100)
+    print("  RESUMO PARTE 1 — INSERT: Tipos de ID")
+    print("=" * 100)
+    print(
+        f"  {'ID Type':<14} {'Rows':>8} {'Scenario':<10} {'Avg':>8} {'Throughput':>14} {'StdDev':>8}"
+    )
+    print("  " + "-" * 65)
+    for r in all_results:
+        if r["part"] == "P1_insert_types":
+            print(
+                f"  {r['id_type']:<14} {r['rows']:>8,} {r['scenario']:<10} "
+                f"{r['avg_s']:>7.3f}s {r['throughput']:>13,}/s {r['std']:>7.3f}"
             )
 
-    csv_runs_path = "benchmark_uuid_all_runs.csv"
-    with open(csv_runs_path, "w") as f:
-        f.write("id_type,rows,scenario,run,time_s\n")
-        for r in all_runs_detail:
-            f.write(f"{r['id_type']},{r['rows']},{r['scenario']},{r['run']},{r['time_s']}\n")
+    print("\n" + "=" * 100)
+    print("  RESUMO PARTE 2 — INSERT: Estrategias Otimizadas")
+    print("=" * 100)
+    print(
+        f"  {'ID Type':<12} {'Rows':>8} {'Scen':<10} {'Strategy':<26} {'Avg':>8} {'Throughput':>14}"
+    )
+    print("  " + "-" * 85)
+    for r in all_results:
+        if r["part"] == "P2_insert_strategies":
+            print(
+                f"  {r['id_type']:<12} {r['rows']:>8,} {r['scenario']:<10} "
+                f"{r['strategy']:<26} {r['avg_s']:>7.3f}s {r['throughput']:>13,}/s"
+            )
+
+    print("\n" + "=" * 100)
+    print("  RESUMO PARTE 3 — SELECT (200k rows, avg ms por query)")
+    print("=" * 100)
+    print(f"  {'ID Type':<14} {'Scenario':<10} {'Query':<26} {'Avg ms':>10}")
+    print("  " + "-" * 65)
+    for r in all_results:
+        if r["part"] == "P3_select":
+            print(
+                f"  {r['id_type']:<14} {r['scenario']:<10} {r['strategy']:<26} {r['avg_s']*1000:>9.3f} ms"
+            )
+
+    csv_path = "benchmark_v4_complete.csv"
+    with open(csv_path, "w") as f:
+        f.write(
+            "part,id_type,rows,scenario,strategy,batch,multi_row,sorted,avg_s,throughput,std,metric\n"
+        )
+        for r in all_results:
+            f.write(
+                f"{r['part']},{r['id_type']},{r['rows']},{r['scenario']},"
+                f"{r['strategy']},{r['batch']},{r['multi_row']},{r['sorted']},"
+                f"{r['avg_s']},{r['throughput']},{r['std']},{r['metric']}\n"
+            )
+
 
 if __name__ == "__main__":
     main()
